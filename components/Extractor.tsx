@@ -1092,7 +1092,8 @@ export default function Extractor() {
             /#include/.test(text) ||
             /\bint\s+main\s*\(/.test(text) ||
             /\bprintf\s*\(/.test(text) ||
-            /\bscanf\s*\(/.test(text)));
+            /\bscanf\s*\(/.test(text) ||
+            /<\/?[a-z][\s\S]*>/i.test(text)));
 
       if (looksLikeCode) {
         const cleaned = cleanOCRCode(text);
@@ -1311,7 +1312,8 @@ export default function Extractor() {
     /\.forEach\s*\(/.test(result) ||
     /\.reduce\s*\(/.test(result) ||
     /#include/.test(result) ||
-    /\bint\s+main\s*\(/.test(result);
+    /\bint\s+main\s*\(/.test(result) ||
+    /<\/?[a-z][\s\S]*>/i.test(result);
 
   return (
     <>
