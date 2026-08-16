@@ -1201,7 +1201,10 @@ export default function Extractor() {
       // AI PROVIDER WITH LOCAL FALLBACK
       // ---------------------------------------------------
 
-      if (providerData.provider === "openai") {
+      if (
+        providerData.provider === "gemini" ||
+        providerData.provider === "openai"
+      ) {
         try {
           const form = new FormData();
 

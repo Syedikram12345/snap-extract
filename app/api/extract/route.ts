@@ -1,11 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
+
 import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
+
+import { getProvider } from "@/lib/provider";
+
+export const runtime = "nodejs";
+
+// ---------------------------------------------------------
+// REQUEST VALIDATION
+// ---------------------------------------------------------
 
 const requestSchema = z.object({
   image: z.string().min(1),
   mode: z.enum(["auto", "text", "code", "table"]).default("auto"),
 });
+
+// ---------------------------------------------------------
+// EXTRACTION PROMPT
+// ---------------------------------------------------------
 
 const extractionPrompt = `
 You are SnapExtract, a highly accurate screenshot-to-text and screenshot-to-code extraction engine.
@@ -13,6 +27,7 @@ You are SnapExtract, a highly accurate screenshot-to-text and screenshot-to-code
 Your ONLY job is to transcribe what is visible in the screenshot.
 
 GENERAL RULES:
+
 - Extract only visible content.
 - Do not summarize.
 - Do not explain.
@@ -35,7 +50,6 @@ You MUST preserve:
 : ; , .
 = == === != !==
 => + - * / % && || ! ?
-" ' \`
 
 Pay special attention to:
 
@@ -60,6 +74,7 @@ Pay special attention to:
 IMPORTANT:
 
 Do NOT turn:
+
 10 into 1
 10 into 1@
 10 into 1e
@@ -74,62 +89,185 @@ Do not optimize code.
 Do not rewrite code.
 Do not add missing code.
 
-If the screenshot contains:
-
-const users = [
-  { name: "John", age: 20 },
-  { name: "Sarah", age: 21 }
-];
-
-the output must preserve the complete structure.
+If the screenshot contains code, preserve the complete structure.
 
 Return ONLY the extracted content.
 `;
 
+// ---------------------------------------------------------
+// MODE INSTRUCTIONS
+// ---------------------------------------------------------
+
+function getModeInstruction(mode: "auto" | "text" | "code" | "table") {
+  return {
+    auto: `
+Determine whether the screenshot contains:
+
+- normal text
+- programming code
+- a table
+- another structured format
+
+Extract it accurately.
+`,
+
+    text: `
+Treat this primarily as normal text.
+
+Preserve paragraphs, line breaks, punctuation and wording.
+`,
+
+    code: `
+Treat this as programming code.
+
+Prioritize:
+
+1. Exact characters
+2. Numbers
+3. Brackets
+4. Operators
+5. Strings
+6. Indentation
+7. Line breaks
+
+Never simplify or rewrite the code.
+`,
+
+    table: `
+Treat this as a table.
+
+Preserve rows, columns, headings and cell values.
+`,
+  }[mode];
+}
+
+// ---------------------------------------------------------
+// BASE64 IMAGE PARSER
+// ---------------------------------------------------------
+
+function extractBase64Image(image: string) {
+  const match = image.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+
+  if (!match) {
+    throw new Error("Invalid image format.");
+  }
+
+  return {
+    mimeType: match[1],
+    base64: match[2],
+  };
+}
+
+// =========================================================
+// OPENAI
+// =========================================================
+
+async function extractWithOpenAI(
+  image: string,
+  mode: "auto" | "text" | "code" | "table",
+) {
+  const apiKey = process.env.OPENAI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not configured.");
+  }
+
+  const client = new OpenAI({
+    apiKey,
+  });
+
+  const response = await client.responses.create({
+    model: process.env.OPENAI_MODEL || "gpt-5.6-luna",
+
+    input: [
+      {
+        role: "user",
+
+        content: [
+          {
+            type: "input_text",
+
+            text: `${extractionPrompt}
+
+EXTRACTION MODE:
+
+${getModeInstruction(mode)}`,
+          },
+
+          {
+            type: "input_image",
+
+            image_url: image,
+
+            detail: "high",
+          },
+        ],
+      },
+    ],
+  });
+
+  return response.output_text?.trim() || "";
+}
+
+// =========================================================
+// GEMINI
+// =========================================================
+
+async function extractWithGemini(
+  image: string,
+  mode: "auto" | "text" | "code" | "table",
+) {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+
+  const { mimeType, base64 } = extractBase64Image(image);
+
+  const ai = new GoogleGenAI({
+    apiKey,
+  });
+
+  const response = await ai.models.generateContent({
+    model: process.env.GEMINI_MODEL || "gemini-2.5-flash-lite",
+
+    contents: [
+      {
+        inlineData: {
+          mimeType,
+          data: base64,
+        },
+      },
+
+      {
+        text: `${extractionPrompt}
+
+EXTRACTION MODE:
+
+${getModeInstruction(mode)}`,
+      },
+    ],
+  });
+
+  return response.text?.trim() || "";
+}
+
+// =========================================================
+// MAIN API
+// =========================================================
+
 export async function POST(request: NextRequest) {
   try {
     // -----------------------------------------------------
-    // CHECK OPENAI CONFIGURATION
+    // GET CURRENT PROVIDER
     // -----------------------------------------------------
 
-    /*
-     * IMPORTANT:
-     *
-     * We intentionally create the OpenAI client ONLY after
-     * checking for the API key.
-     *
-     * This allows the application to build successfully
-     * without an OpenAI API key.
-     *
-     * Local OCR does not require OpenAI.
-     */
-
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    if (!apiKey) {
-      return NextResponse.json(
-        {
-          error:
-            "OpenAI API key is not configured. Use Local OCR or configure OPENAI_API_KEY.",
-        },
-        { status: 503 },
-      );
-    }
-
-    const client = new OpenAI({
-      apiKey,
-    });
+    const provider = await getProvider();
 
     // -----------------------------------------------------
-    // READ REQUEST
+    // REQUEST DATA
     // -----------------------------------------------------
-
-    /*
-     * Support BOTH:
-     *
-     * 1. multipart/form-data
-     * 2. JSON
-     */
 
     const contentType = request.headers.get("content-type") || "";
 
@@ -137,9 +275,9 @@ export async function POST(request: NextRequest) {
 
     let mode: "auto" | "text" | "code" | "table" = "auto";
 
-    // -----------------------------------------------------
+    // =====================================================
     // FORM DATA
-    // -----------------------------------------------------
+    // =====================================================
 
     if (contentType.includes("multipart/form-data")) {
       const formData = await request.formData();
@@ -153,7 +291,9 @@ export async function POST(request: NextRequest) {
           {
             error: "No image was provided.",
           },
-          { status: 400 },
+          {
+            status: 400,
+          },
         );
       }
 
@@ -162,7 +302,22 @@ export async function POST(request: NextRequest) {
           {
             error: "The uploaded file must be an image.",
           },
-          { status: 400 },
+          {
+            status: 400,
+          },
+        );
+      }
+
+      const maxBytes = Number(process.env.MAX_IMAGE_BYTES || 10485760);
+
+      if (file.size > maxBytes) {
+        return NextResponse.json(
+          {
+            error: "Image is too large.",
+          },
+          {
+            status: 413,
+          },
         );
       }
 
@@ -180,9 +335,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // -----------------------------------------------------
+    // =====================================================
     // JSON
-    // -----------------------------------------------------
+    // =====================================================
     else {
       const body = await request.json();
 
@@ -193,7 +348,9 @@ export async function POST(request: NextRequest) {
           {
             error: "Invalid request.",
           },
-          { status: 400 },
+          {
+            status: 400,
+          },
         );
       }
 
@@ -203,7 +360,7 @@ export async function POST(request: NextRequest) {
     }
 
     // -----------------------------------------------------
-    // VALIDATE IMAGE
+    // IMAGE CHECK
     // -----------------------------------------------------
 
     if (!image) {
@@ -211,143 +368,105 @@ export async function POST(request: NextRequest) {
         {
           error: "No image was provided.",
         },
-        { status: 400 },
+        {
+          status: 400,
+        },
       );
     }
 
-    // -----------------------------------------------------
-    // MODE INSTRUCTIONS
-    // -----------------------------------------------------
+    // =====================================================
+    // LOCAL
+    // =====================================================
 
-    const modeInstruction = {
-      auto: `
-Determine whether the screenshot contains:
-
-- normal text
-- programming code
-- a table
-- another structured format
-
-Extract it accurately.
-`,
-
-      text: `
-Treat this primarily as normal text.
-
-Preserve paragraphs, line breaks, punctuation and wording.
-`,
-
-      code: `
-Treat this as programming code.
-
-Prioritize:
-
-1. Exact characters
-2. Numbers
-3. Brackets
-4. Operators
-5. Strings
-6. Indentation
-7. Line breaks
-
-Never simplify or rewrite the code.
-`,
-
-      table: `
-Treat this as a table.
-
-Preserve rows, columns, headings and cell values.
-`,
-    }[mode];
-
-    // -----------------------------------------------------
-    // OPENAI REQUEST
-    // -----------------------------------------------------
-
-    const response = await client.responses.create({
-      model: process.env.OPENAI_MODEL || "gpt-5.6-luna",
-
-      input: [
-        {
-          role: "user",
-
-          content: [
-            {
-              type: "input_text",
-
-              text: `${extractionPrompt}
-
-EXTRACTION MODE:
-
-${modeInstruction}`,
-            },
-
-            {
-              type: "input_image",
-
-              image_url: image,
-
-              detail: "high",
-            },
-          ],
-        },
-      ],
-    });
-
-    // -----------------------------------------------------
-    // GET RESULT
-    // -----------------------------------------------------
-
-    const text = response.output_text?.trim();
-
-    if (!text) {
+    if (provider === "local") {
       return NextResponse.json(
         {
-          error: "No text could be extracted from this image.",
+          success: false,
+          provider: "local",
+          local: true,
+          error: "Local OCR should be processed by the browser.",
         },
-        { status: 422 },
+        {
+          status: 400,
+        },
       );
     }
 
-    return NextResponse.json({
-      success: true,
-      text,
-      mode,
-    });
+    // =====================================================
+    // GEMINI
+    // =====================================================
+
+    if (provider === "gemini") {
+      const text = await extractWithGemini(image, mode);
+
+      if (!text) {
+        return NextResponse.json(
+          {
+            error: "Gemini could not extract text from this image.",
+          },
+          {
+            status: 422,
+          },
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        provider: "gemini",
+        text,
+        mode,
+      });
+    }
+
+    // =====================================================
+    // OPENAI
+    // =====================================================
+
+    if (provider === "openai") {
+      const text = await extractWithOpenAI(image, mode);
+
+      if (!text) {
+        return NextResponse.json(
+          {
+            error: "OpenAI could not extract text from this image.",
+          },
+          {
+            status: 422,
+          },
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        provider: "openai",
+        text,
+        mode,
+      });
+    }
+
+    // -----------------------------------------------------
+    // UNKNOWN PROVIDER
+    // -----------------------------------------------------
+
+    return NextResponse.json(
+      {
+        error: "Unknown extraction provider.",
+      },
+      {
+        status: 500,
+      },
+    );
   } catch (error: unknown) {
     console.error("Extraction error:", error);
-
-    // -----------------------------------------------------
-    // OPENAI QUOTA ERROR
-    // -----------------------------------------------------
-
-    const errorCode =
-      typeof error === "object" && error !== null && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-
-    if (errorCode === "insufficient_quota") {
-      return NextResponse.json(
-        {
-          error:
-            "Your OpenAI account has no remaining quota. Check your OpenAI billing. This isn't a code issue.",
-
-          quotaExceeded: true,
-        },
-        { status: 429 },
-      );
-    }
-
-    // -----------------------------------------------------
-    // GENERAL ERROR
-    // -----------------------------------------------------
 
     if (error instanceof Error) {
       return NextResponse.json(
         {
           error: error.message || "Unable to process this image right now.",
         },
-        { status: 500 },
+        {
+          status: 500,
+        },
       );
     }
 
@@ -355,7 +474,9 @@ ${modeInstruction}`,
       {
         error: "Unable to process this image right now.",
       },
-      { status: 500 },
+      {
+        status: 500,
+      },
     );
   }
 }
