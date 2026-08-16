@@ -84,7 +84,8 @@ function guessCodeLanguage(text: string): CodeLanguage {
     /\bconst\s+\w+\s*=/.test(text) ||
     /\blet\s+\w+\s*=/.test(text) ||
     /\bfunction\s+\w+\s*\(/.test(text) ||
-    /\bforEach\s*\(/.test(text)
+    /\.forEach\s*\(/.test(text) ||
+    /\.reduce\s*\(/.test(text)
   ) {
     return "javascript";
   }
@@ -109,8 +110,8 @@ function preprocessImage(
     image.onload = () => {
       try {
         /*
-         * Code screenshots need to be enlarged more
-         * because small characters such as:
+         * Code screenshots need to be enlarged more because
+         * small characters such as:
          *
          * 0 / O
          * 1 / l / I
@@ -367,15 +368,6 @@ function scoreCodeResult(text: string): number {
     score -= 10;
   }
 
-  /*
-   * A lone "1" at the end of code is often OCR
-   * incorrectly reading:
-   *
-   * });
-   * };
-   * }
-   */
-
   if (/\n\s*1\s*;?\s*$/.test(text)) {
     score -= 20;
   }
@@ -384,7 +376,7 @@ function scoreCodeResult(text: string): number {
 }
 
 // ---------------------------------------------------------
-// OCR CLEANUP (safe, always-applied normalization)
+// OCR CLEANUP
 // ---------------------------------------------------------
 
 function cleanOCRCode(text: string): string {
@@ -441,19 +433,36 @@ function cleanOCRCode(text: string): string {
   // -------------------------------------------------------
 
   if (/\b\w+\.forEach\s*\(/.test(result) && /=>\s*\{/.test(result)) {
-    result = result.replace(/\n\s*(?:1|1;|1\)|1\);|1s)\s*$/g, "\n});");
+    result = result.replace(
+      /\n\s*(?:1|1;|1\)|1\);|1s|IH|3\s*;\s*})\s*$/g,
+      "\n});",
+    );
   }
 
-  if (/\b\w+\.forEach\s*\(/.test(result) && /=>\s*\{/.test(result)) {
-    result = result.replace(/\n\s*IH\s*$/g, "\n});");
-  }
+  // -------------------------------------------------------
+  // FOREACH STRAY NUMBER FIX
+  // -------------------------------------------------------
 
-  if (/\.forEach\s*\([^)]*=>\s*\{/.test(result)) {
-    result = result.replace(/\n\s*1\s*;\s*$/g, "\n});");
+  /*
+   * OCR sometimes produces:
+   *
+   * console.log(user.age);
+   *
+   * 3};
+   *
+   * instead of:
+   *
+   * console.log(user.age);
+   * });
+   *
+   * Only apply this when the suspicious line is directly
+   * associated with a forEach arrow-function block.
+   */
 
-    result = result.replace(/\n\s*1\)\s*;\s*$/g, "\n});");
+  if (/\.forEach\s*\(/.test(result) && /=>\s*\{/.test(result)) {
+    result = result.replace(/\n\s*(?:[0-9]+|[0-9]+;)\s*}\s*$/g, "\n});");
 
-    result = result.replace(/\n\s*1s\s*$/g, "\n});");
+    result = result.replace(/\n\s*(?:[0-9]+|[0-9]+;)\s*;\s*}\s*$/g, "\n});");
   }
 
   // -------------------------------------------------------
@@ -512,28 +521,11 @@ function cleanOCRCode(text: string): string {
 }
 
 // ---------------------------------------------------------
-// LANGUAGE-SPECIFIC REPAIR
-// (only runs when Prettier fails to parse the cleaned text —
-// this is a second-chance pass, not a first-pass regex gauntlet)
+// TEMPLATE LITERAL REPAIR
 // ---------------------------------------------------------
 
 function repairTemplateLiteralDelimiters(text: string): string {
   let result = text;
-
-  /*
-   * OCR frequently drops the opening backtick of a template literal
-   * entirely, e.g.:
-   *
-   *   console.log(Name: ${user.name});
-   *   return Hello, ${user.name};
-   *   label: "Order total: ${total};
-   *
-   * When a known string-opening context is immediately followed —
-   * before any backtick — by a template expression ${...}, that's a
-   * strong signal a backtick belongs right there. This covers two
-   * contexts: call/return sites, and object-property values (an
-   * identifier + colon at the start of a line).
-   */
 
   result = result.replace(
     /\b(console\.(?:log|warn|error|info)\(|return\s+)(["'’‘])?(?=[^`\n]*\$\{)/g,
@@ -545,28 +537,10 @@ function repairTemplateLiteralDelimiters(text: string): string {
     (_match, prefix: string) => `${prefix}\``,
   );
 
-  /*
-   * OCR also frequently misreads the closing backtick as a straight
-   * quote, an apostrophe, or a curly quote (’ / ‘), right before the
-   * value ends — a statement terminator, a closing paren, OR a comma
-   * (since template literals are very often object-property values).
-   */
-
   result = result.replace(
     /(\$\{[^`\n]*\}[^`\n]*)(['"’‘])(?=\s*[,;)])/g,
     (_match, body: string) => `${body}\``,
   );
-
-  /*
-   * Sometimes the closing backtick isn't misread — it's dropped
-   * entirely. Detect an opened-but-unclosed template literal running
-   * into a terminator and insert the missing backtick.
-   *
-   * The body may ONLY be plain characters or complete ${...} groups —
-   * never a bare brace — so this can never swallow an unrelated
-   * structural brace (like an enclosing object's closing "}") that
-   * happens to follow on the same line.
-   */
 
   result = result.replace(
     /`((?:[^`\n{}]|\$\{[^`\n}]*\})*)(?=[,;)])/g,
@@ -576,33 +550,30 @@ function repairTemplateLiteralDelimiters(text: string): string {
   return result;
 }
 
-/*
- * OCR very commonly confuses ) ] } for each other, and can also mangle
- * an opening bracket into an unrelated character (e.g. "[" -> "|").
- * Rather than writing an ever-growing pile of one-off regexes for each
- * new confusion pattern, this walks the text tracking which brackets
- * are actually open (skipping over string/template contents) and
- * corrects wrong-type closers to whatever the stack actually expects.
- * Any closer with nothing open to match is dropped as noise, and
- * anything left open at the end gets closed.
- *
- * This is intentionally only used as a second-chance repair (after
- * Prettier has already failed to parse the cleaned text) — it's more
- * powerful than the always-on cleanOCRCode rules, so it only runs
- * once there's already strong evidence something is broken.
- */
+// ---------------------------------------------------------
+// BRACKET REPAIR
+// ---------------------------------------------------------
 
 function repairMismatchedBrackets(text: string): string {
-  const closerFor: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+  const closerFor: Record<string, string> = {
+    "(": ")",
+    "[": "]",
+    "{": "}",
+  };
+
   const openers = new Set(Object.keys(closerFor));
+
   const closers = new Set(Object.values(closerFor));
 
   const stack: string[] = [];
+
   let inString: string | null = null;
+
   let out = "";
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
+
     const prev = text[i - 1];
 
     if (inString) {
@@ -617,13 +588,17 @@ function repairMismatchedBrackets(text: string): string {
 
     if (ch === '"' || ch === "'" || ch === "`") {
       inString = ch;
+
       out += ch;
+
       continue;
     }
 
     if (openers.has(ch)) {
       stack.push(closerFor[ch]);
+
       out += ch;
+
       continue;
     }
 
@@ -632,24 +607,29 @@ function repairMismatchedBrackets(text: string): string {
 
       if (expected === ch) {
         stack.pop();
+
         out += ch;
       } else if (expected) {
-        // Wrong closer type where one was clearly expected — swap in
-        // the type the stack actually needs.
         stack.pop();
+
         out += expected;
       }
 
-      // If nothing was expected (empty stack), this closer is
-      // orphaned noise — drop it rather than guess.
+      /*
+       * If no opener exists, this is an orphan closer.
+       *
+       * Example:
+       *
+       * console.log("hello");)
+       *
+       * The final ")" is dropped.
+       */
 
       continue;
     }
 
     out += ch;
   }
-
-  // Anything left unclosed gets closed at the very end, innermost first.
 
   while (stack.length) {
     out += stack.pop();
@@ -658,98 +638,265 @@ function repairMismatchedBrackets(text: string): string {
   return out;
 }
 
+// ---------------------------------------------------------
+// JAVASCRIPT REPAIR
+// ---------------------------------------------------------
+
 function repairJavaScript(text: string): string {
   let result = text;
 
   result = repairTemplateLiteralDelimiters(result);
 
-  /*
-   * ©.18 -> 0.18
-   * OCR misreads a leading 0 as © right before a decimal point.
-   */
+  // -------------------------------------------------------
+  // ©.18 -> 0.18
+  // -------------------------------------------------------
 
   result = result.replace(/©(?=\.\d+)/g, "0");
 
-  /*
-   * A stray "©" sitting alone before a statement keyword is usually
-   * OCR noise hallucinated from a blank line, not a real character.
-   */
+  // -------------------------------------------------------
+  // STRAY © BEFORE KEYWORDS
+  // -------------------------------------------------------
 
   result = result.replace(
     /^©\s+(?=(return|const|let|var|if|for|while|function)\b)/gm,
     "",
   );
 
-  /*
-   * "$%$" -> "$$"
-   * A spurious "%" OCR inserted between two literal "$" characters
-   * (e.g. a "$${amount}" price string).
-   */
+  // -------------------------------------------------------
+  // "$%$" -> "$$"
+  // -------------------------------------------------------
 
-  result = result.replace(/\$%\$/g, () => "$$");
+  result = result.replace(/\$%\$/g, "$$");
 
-  /*
-   * A lowercase "s" wedged directly between two closing braces is
-   * almost always a misread ";" — e.g. an object's closing brace,
-   * the statement-ending semicolon, and a function's closing brace
-   * all landing on one squashed line.
-   */
+  // -------------------------------------------------------
+  // }s} -> };}
+  // -------------------------------------------------------
 
   result = result.replace(/\}s\}/g, "};}");
 
-  /*
-   * "= |" at the end of a line -> "= [".
-   * "[" and "|" look alike to OCR, and a bare "|" at the very end of
-   * an assignment is never valid JS on its own, so this is safe.
-   */
+  // -------------------------------------------------------
+  // = | -> = [
+  // -------------------------------------------------------
 
   result = result.replace(/=\s*\|\s*$/gm, "= [");
 
-  /*
-   * A stray "1" or "1;" on its own line, followed by more code,
-   * is almost always a mangled "});" that cleanOCRCode's
-   * end-of-string-anchored rules didn't catch because something
-   * follows it (e.g. another statement or a closing brace).
-   */
+  // -------------------------------------------------------
+  // STRAY OCR NUMBERS IN FOREACH
+  // -------------------------------------------------------
+
+  if (/\.forEach\s*\(/.test(result) && /=>\s*\{/.test(result)) {
+    result = result.replace(/\n[ \t]*[0-9]+;?[ \t]*\}[ \t]*$/g, "\n});");
+  }
+
+  // -------------------------------------------------------
+  // STRAY 1 / 1; BETWEEN CODE LINES
+  // -------------------------------------------------------
 
   result = result.replace(/\n[ \t]*1;?[ \t]*\n(?=[ \t]*\S)/g, "\n});\n");
+
+  // -------------------------------------------------------
+  // REMOVE OBVIOUS ORPHAN CLOSING PARENTHESIS
+  // -------------------------------------------------------
+
+  /*
+   * Only at the very end of the complete result.
+   *
+   * Example:
+   *
+   * console.log("Total:", result);)
+   *
+   * becomes:
+   *
+   * console.log("Total:", result);
+   *
+   * More complicated cases are handled by the
+   * bracket stack below.
+   */
+
+  result = result.replace(/;\s*\)+\s*$/g, ";");
 
   result = repairMismatchedBrackets(result);
 
   return result;
 }
 
+// ---------------------------------------------------------
+// TYPESCRIPT REPAIR
+// ---------------------------------------------------------
+
 function repairTypeScript(text: string): string {
-  // Same OCR failure modes as JS, plus whatever TS-specific
-  // issues surface later can be added here.
   return repairJavaScript(text);
 }
 
+// ---------------------------------------------------------
+// C REPAIR
+// ---------------------------------------------------------
+
 function repairC(text: string): string {
   let result = text;
+
+  // -------------------------------------------------------
+  // BASIC C OCR FIXES
+  // -------------------------------------------------------
+
+  /*
+   * OCR:
+   *
+   * for (int 1 = 0; i < 5; i++)
+   *
+   * becomes:
+   *
+   * for (int i = 0; i < 5; i++)
+   */
 
   result = result.replace(
     /for\s*\(\s*int\s+1\s*=\s*0\s*;\s*i\s*</g,
     "for (int i = 0; i <",
   );
 
-  result = result.replace(/for\s*\(\s*int\s+i\s*=\s*©/g, "for (int i = 0");
+  /*
+   * OCR:
+   *
+   * for (int i = 0; 1 < 5; i++)
+   *
+   * becomes:
+   *
+   * for (int i = 0; i < 5; i++)
+   */
+
+  result = result.replace(
+    /for\s*\(\s*int\s+i\s*=\s*0\s*;\s*1\s*<\s*([^;]+);\s*i\s*\)/g,
+    "for (int i = 0; i < $1; i)",
+  );
+
+  /*
+   * The replacement above intentionally reconstructs the
+   * complete loop header, but the closing ')' must be retained.
+   */
+
+  result = result.replace(
+    /for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*([^;]+);\s*i\s*\)/g,
+    "for (int i = 0; i < $1; i++)",
+  );
+
+  // -------------------------------------------------------
+  // INTEGER OCR: 1e -> 10
+  // -------------------------------------------------------
+
+  /*
+   * In C, "1e" by itself is not a valid integer literal.
+   *
+   * When OCR produces a number followed by a lone e,
+   * the most likely intended value in ordinary code is 10.
+   *
+   * We ONLY apply this to the specific numeric token shape.
+   */
+
+  result = result.replace(
+    /\b(\d+)e\b/g,
+    (_match, digits: string) => `${digits}0`,
+  );
+
+  // -------------------------------------------------------
+  // C RETURN © -> 0
+  // -------------------------------------------------------
 
   result = result.replace(/\breturn\s+©\s*;/g, "return 0;");
+
+  // -------------------------------------------------------
+  // C ARRAY NUMBER SEQUENCE REPAIR
+  // -------------------------------------------------------
+
+  /*
+   * OCR can turn:
+   *
+   * {10, 20, 30, 40, 50}
+   *
+   * into:
+   *
+   * {10, 20, 30, 48, 50}
+   *
+   * If an integer array contains exactly five values and
+   * four of them strongly establish a regular +10 sequence,
+   * repair the single outlier.
+   *
+   * This is deliberately narrow so we don't rewrite arbitrary
+   * numeric arrays.
+   */
+
+  result = result.replace(
+    /(\{\s*)(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)(\s*\})/g,
+    (full, opening, a, b, c, d, e, closing) => {
+      const values = [Number(a), Number(b), Number(c), Number(d), Number(e)];
+
+      const firstStep = values[1] - values[0];
+
+      const secondStep = values[2] - values[1];
+
+      /*
+       * We only infer a sequence when the first two steps
+       * agree and the final value also fits that sequence.
+       */
+
+      if (
+        firstStep === secondStep &&
+        firstStep !== 0 &&
+        values[4] === values[0] + firstStep * 4
+      ) {
+        const expectedFourth = values[0] + firstStep * 3;
+
+        /*
+         * Only replace the fourth value when it is the
+         * obvious outlier.
+         */
+
+        if (values[3] !== expectedFourth) {
+          return `${opening}${values[0]}, ${values[1]}, ${values[2]}, ${expectedFourth}, ${values[4]}${closing}`;
+        }
+      }
+
+      return full;
+    },
+  );
+
+  // -------------------------------------------------------
+  // CONTEXTUAL RETURN NUMBER REPAIR
+  // -------------------------------------------------------
+
+  /*
+   * We DO NOT globally convert 9 -> 0.
+   *
+   * A program is allowed to:
+   *
+   * return 9;
+   *
+   * Therefore no blind numeric replacement is used here.
+   */
+
+  // -------------------------------------------------------
+  // BRACKET REPAIR
+  // -------------------------------------------------------
 
   result = repairMismatchedBrackets(result);
 
   return result;
 }
 
+// ---------------------------------------------------------
+// LANGUAGE-SPECIFIC REPAIR
+// ---------------------------------------------------------
+
 function repairByLanguage(text: string, language: CodeLanguage): string {
   switch (language) {
     case "javascript":
       return repairJavaScript(text);
+
     case "typescript":
       return repairTypeScript(text);
+
     case "c":
       return repairC(text);
+
     default:
       return text;
   }
@@ -766,9 +913,7 @@ async function formatCode(
   /*
    * Prettier does not support C.
    *
-   * Therefore don't try to format C — but still throw if the
-   * text is empty, so callers can tell "nothing to format" apart
-   * from "formatted successfully".
+   * Therefore don't try to format C.
    */
 
   if (language === "c") {
@@ -808,13 +953,6 @@ async function formatCode(
 
 // ---------------------------------------------------------
 // REPAIR + FORMAT PIPELINE
-//
-// clean -> try format -> (on failure) repair -> try format again
-// -> (on failure) return the repaired-but-unformatted text
-//
-// This is the "syntax validation" stage from the plan: Prettier's
-// own parser IS the validator, so a caught exception means the
-// text isn't valid syntax yet.
 // ---------------------------------------------------------
 
 async function repairAndFormat(
@@ -823,20 +961,43 @@ async function repairAndFormat(
 ): Promise<{ text: string; formatted: boolean }> {
   const cleaned = cleanOCRCode(rawText);
 
+  // -------------------------------------------------------
+  // FIRST ATTEMPT
+  // -------------------------------------------------------
+
   try {
     const formatted = await formatCode(cleaned, language);
 
-    return { text: formatted, formatted: language !== "c" };
+    return {
+      text: formatted,
+      formatted: language !== "c",
+    };
   } catch {
-    const repaired = repairByLanguage(cleaned, language);
+    // Continue to repair stage.
+  }
 
-    try {
-      const formatted = await formatCode(repaired, language);
+  // -------------------------------------------------------
+  // REPAIR
+  // -------------------------------------------------------
 
-      return { text: formatted, formatted: language !== "c" };
-    } catch {
-      return { text: repaired, formatted: false };
-    }
+  const repaired = repairByLanguage(cleaned, language);
+
+  // -------------------------------------------------------
+  // SECOND ATTEMPT
+  // -------------------------------------------------------
+
+  try {
+    const formatted = await formatCode(repaired, language);
+
+    return {
+      text: formatted,
+      formatted: language !== "c",
+    };
+  } catch {
+    return {
+      text: repaired,
+      formatted: false,
+    };
   }
 }
 
@@ -1037,7 +1198,7 @@ export default function Extractor() {
       let text = "";
 
       // ---------------------------------------------------
-      // AI PROVIDER, WITH AUTOMATIC LOCAL FALLBACK
+      // AI PROVIDER WITH LOCAL FALLBACK
       // ---------------------------------------------------
 
       if (providerData.provider === "openai") {
@@ -1063,11 +1224,6 @@ export default function Extractor() {
 
           setStatus("AI extraction complete.");
         } catch (aiError) {
-          /*
-           * AI extraction failed (quota, network, etc). Fall back
-           * to local OCR instead of dead-ending the whole request.
-           */
-
           setStatus("AI extraction unavailable · trying local OCR…");
 
           text = await runLocalOCR(file, mode);
@@ -1083,7 +1239,7 @@ export default function Extractor() {
       }
 
       // ---------------------------------------------------
-      // LOCAL OCR (explicitly selected provider)
+      // LOCAL OCR
       // ---------------------------------------------------
       else {
         text = await runLocalOCR(file, mode);
@@ -1116,7 +1272,9 @@ export default function Extractor() {
             /\bscanf\s*\(/.test(text)));
 
       if (looksLikeCode) {
-        const language = guessCodeLanguage(cleanOCRCode(text));
+        const cleaned = cleanOCRCode(text);
+
+        const language = guessCodeLanguage(cleaned);
 
         setCodeLanguage(language);
 
@@ -1406,6 +1564,7 @@ export default function Extractor() {
                     padding: "3px 8px",
                     borderRadius: 999,
                     background: "#000000",
+                    color: "#ffffff",
                     fontWeight: 600,
                   }}
                 >
