@@ -1106,17 +1106,16 @@ async function formatCode(
   text: string,
   language: CodeLanguage,
 ): Promise<string> {
-  // -------------------------------------------------------
-  // C
-  // -------------------------------------------------------
+  /*
+   * C is intentionally not formatted here.
+   *
+   * We don't want to modify valid C code with
+   * an unreliable formatter.
+   */
 
   if (language === "c") {
-    return formatCCode(text);
+    return text.trim();
   }
-
-  // -------------------------------------------------------
-  // OTHER LANGUAGES
-  // -------------------------------------------------------
 
   const parser =
     language === "typescript"
@@ -1158,10 +1157,6 @@ async function repairAndFormat(
 ): Promise<{ text: string; formatted: boolean }> {
   const cleaned = cleanOCRCode(rawText);
 
-  // -------------------------------------------------------
-  // FIRST ATTEMPT
-  // -------------------------------------------------------
-
   try {
     const formatted = await formatCode(cleaned, language);
 
@@ -1173,22 +1168,14 @@ async function repairAndFormat(
     // Continue to repair stage.
   }
 
-  // -------------------------------------------------------
-  // REPAIR
-  // -------------------------------------------------------
-
   const repaired = repairByLanguage(cleaned, language);
-
-  // -------------------------------------------------------
-  // SECOND ATTEMPT
-  // -------------------------------------------------------
 
   try {
     const formatted = await formatCode(repaired, language);
 
     return {
       text: formatted,
-      formatted: true,
+      formatted: language !== "c",
     };
   } catch {
     return {
