@@ -7,10 +7,6 @@ const requestSchema = z.object({
   mode: z.enum(["auto", "text", "code", "table"]).default("auto"),
 });
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 const extractionPrompt = `
 You are SnapExtract, a highly accurate screenshot-to-text and screenshot-to-code extraction engine.
 
@@ -42,6 +38,7 @@ You MUST preserve:
 " ' \`
 
 Pay special attention to:
+
 - Curly braces
 - Square brackets
 - Parentheses
@@ -91,25 +88,64 @@ Return ONLY the extracted content.
 
 export async function POST(request: NextRequest) {
   try {
+    // -----------------------------------------------------
+    // CHECK OPENAI CONFIGURATION
+    // -----------------------------------------------------
+
+    /*
+     * IMPORTANT:
+     *
+     * We intentionally create the OpenAI client ONLY after
+     * checking for the API key.
+     *
+     * This allows the application to build successfully
+     * without an OpenAI API key.
+     *
+     * Local OCR does not require OpenAI.
+     */
+
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          error:
+            "OpenAI API key is not configured. Use Local OCR or configure OPENAI_API_KEY.",
+        },
+        { status: 503 },
+      );
+    }
+
+    const client = new OpenAI({
+      apiKey,
+    });
+
+    // -----------------------------------------------------
+    // READ REQUEST
+    // -----------------------------------------------------
+
     /*
      * Support BOTH:
      *
-     * 1. JSON requests
-     * 2. FormData requests
-     *
-     * This makes the API compatible with the current frontend
-     * and also makes it easier to use later.
+     * 1. multipart/form-data
+     * 2. JSON
      */
 
     const contentType = request.headers.get("content-type") || "";
 
     let image = "";
+
     let mode: "auto" | "text" | "code" | "table" = "auto";
+
+    // -----------------------------------------------------
+    // FORM DATA
+    // -----------------------------------------------------
 
     if (contentType.includes("multipart/form-data")) {
       const formData = await request.formData();
 
       const file = formData.get("image");
+
       const formMode = formData.get("mode");
 
       if (!(file instanceof File)) {
@@ -142,7 +178,12 @@ export async function POST(request: NextRequest) {
       ) {
         mode = formMode;
       }
-    } else {
+    }
+
+    // -----------------------------------------------------
+    // JSON
+    // -----------------------------------------------------
+    else {
       const body = await request.json();
 
       const parsed = requestSchema.safeParse(body);
@@ -157,8 +198,13 @@ export async function POST(request: NextRequest) {
       }
 
       image = parsed.data.image;
+
       mode = parsed.data.mode;
     }
+
+    // -----------------------------------------------------
+    // VALIDATE IMAGE
+    // -----------------------------------------------------
 
     if (!image) {
       return NextResponse.json(
@@ -169,18 +215,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return NextResponse.json(
-        {
-          error: "OpenAI API key is not configured.",
-        },
-        { status: 500 },
-      );
-    }
+    // -----------------------------------------------------
+    // MODE INSTRUCTIONS
+    // -----------------------------------------------------
 
     const modeInstruction = {
       auto: `
 Determine whether the screenshot contains:
+
 - normal text
 - programming code
 - a table
@@ -188,14 +230,18 @@ Determine whether the screenshot contains:
 
 Extract it accurately.
 `,
+
       text: `
 Treat this primarily as normal text.
+
 Preserve paragraphs, line breaks, punctuation and wording.
 `,
+
       code: `
 Treat this as programming code.
 
 Prioritize:
+
 1. Exact characters
 2. Numbers
 3. Brackets
@@ -206,11 +252,17 @@ Prioritize:
 
 Never simplify or rewrite the code.
 `,
+
       table: `
 Treat this as a table.
+
 Preserve rows, columns, headings and cell values.
 `,
     }[mode];
+
+    // -----------------------------------------------------
+    // OPENAI REQUEST
+    // -----------------------------------------------------
 
     const response = await client.responses.create({
       model: process.env.OPENAI_MODEL || "gpt-5.6-luna",
@@ -218,23 +270,33 @@ Preserve rows, columns, headings and cell values.
       input: [
         {
           role: "user",
+
           content: [
             {
               type: "input_text",
+
               text: `${extractionPrompt}
 
 EXTRACTION MODE:
+
 ${modeInstruction}`,
             },
+
             {
               type: "input_image",
+
               image_url: image,
+
               detail: "high",
             },
           ],
         },
       ],
     });
+
+    // -----------------------------------------------------
+    // GET RESULT
+    // -----------------------------------------------------
 
     const text = response.output_text?.trim();
 
@@ -255,12 +317,9 @@ ${modeInstruction}`,
   } catch (error: unknown) {
     console.error("Extraction error:", error);
 
-    /*
-     * OpenAI SDK errors carry a `code` field. Distinguish a billing
-     * quota problem from everything else so the message you see
-     * (and the one the frontend falls back on) actually tells you
-     * what's wrong instead of a generic "something broke".
-     */
+    // -----------------------------------------------------
+    // OPENAI QUOTA ERROR
+    // -----------------------------------------------------
 
     const errorCode =
       typeof error === "object" && error !== null && "code" in error
@@ -271,12 +330,17 @@ ${modeInstruction}`,
       return NextResponse.json(
         {
           error:
-            "Your OpenAI account has no remaining quota. Check billing at platform.openai.com/account/billing — this isn't a code issue.",
+            "Your OpenAI account has no remaining quota. Check your OpenAI billing. This isn't a code issue.",
+
           quotaExceeded: true,
         },
         { status: 429 },
       );
     }
+
+    // -----------------------------------------------------
+    // GENERAL ERROR
+    // -----------------------------------------------------
 
     if (error instanceof Error) {
       return NextResponse.json(
