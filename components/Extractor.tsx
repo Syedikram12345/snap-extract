@@ -22,6 +22,10 @@ import typescriptPlugin from "prettier/plugins/typescript";
 import htmlPlugin from "prettier/plugins/html";
 import cssPlugin from "prettier/plugins/postcss";
 
+import initClangFormat, {
+  format as clangFormat,
+} from "@wasm-fmt/clang-format/web";
+
 type Mode = "auto" | "text" | "code" | "table";
 
 type CodeLanguage = "javascript" | "typescript" | "json" | "html" | "css" | "c";
@@ -547,32 +551,17 @@ function repairByLanguage(text: string, language: CodeLanguage): string {
 }
 
 /* =========================================================
-   C FORMATTER
+   C FORMATTER (fallback, regex-based)
+
+   This is only used if the real clang-format WASM engine
+   (see below) fails to load or fails to format the given
+   text. It is deliberately forgiving rather than precise.
 ========================================================= */
 
-function formatCCode(text: string): string {
+function formatCCodeFallback(text: string): string {
   let source = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
 
-  /*
-   * Add line breaks around braces.
-   *
-   * This is important because OCR often gives:
-   *
-   * int main() { int x = 10; printf(...); }
-   *
-   * and we want:
-   *
-   * int main() {
-   *     int x = 10;
-   *     printf(...);
-   * }
-   */
-
   source = source.replace(/\{/g, "{\n").replace(/\}/g, "\n}\n");
-
-  /*
-   * Put common C statements on separate lines.
-   */
 
   source = source.replace(
     /;\s*(?=(?:int|char|float|double|printf|scanf|return|if|for|while)\b)/g,
@@ -594,35 +583,18 @@ function formatCCode(text: string): string {
       continue;
     }
 
-    /*
-     * Basic whitespace cleanup.
-     */
     line = line.replace(/[ \t]+/g, " ");
-
-    /*
-     * Remove spaces immediately inside
-     * parentheses/brackets.
-     */
     line = line.replace(/\(\s+/g, "(");
-
     line = line.replace(/\s+\)/g, ")");
-
     line = line.replace(/\[\s+/g, "[");
-
     line = line.replace(/\s+\]/g, "]");
 
-    /*
-     * Closing brace decreases indentation first.
-     */
     if (line.startsWith("}")) {
       indent = Math.max(0, indent - 1);
     }
 
     output.push(`${INDENT.repeat(indent)}${line}`);
 
-    /*
-     * Count braces.
-     */
     let open = 0;
     let close = 0;
 
@@ -676,7 +648,52 @@ function formatCCode(text: string): string {
     }
   }
 
-  return output.join("\n").trim();
+  // Re-attach a stray closing brace + semicolon, e.g.
+  //   }
+  //   ;
+  // back into "};" — a common artifact of the naive
+  // brace-splitting above.
+  let joined = output.join("\n");
+
+  joined = joined.replace(/\}\n(\s*);/g, "};");
+
+  // Re-attach "} else" split across lines back into
+  // "} else {" on one line.
+  joined = joined.replace(/\}\n(\s*)else\b/g, "} else");
+
+  return joined.trim();
+}
+
+/* =========================================================
+   C FORMATTER (real formatter, via clang-format WASM)
+
+   Uses the actual clang-format engine compiled to WASM
+   instead of regex patching, so brace/semicolon/else
+   placement is handled correctly by construction.
+========================================================= */
+
+let clangFormatReady: Promise<void> | null = null;
+
+async function ensureClangFormat(): Promise<void> {
+  if (!clangFormatReady) {
+    clangFormatReady = initClangFormat().catch((error) => {
+      // Allow retrying on the next call instead of caching a failure.
+      clangFormatReady = null;
+      throw error;
+    });
+  }
+
+  return clangFormatReady;
+}
+
+async function formatCCode(text: string): Promise<string> {
+  try {
+    await ensureClangFormat();
+
+    return clangFormat(text, "main.c", "LLVM").trim();
+  } catch {
+    return formatCCodeFallback(text);
+  }
 }
 
 /* =========================================================
@@ -688,8 +705,8 @@ async function formatCode(
   language: CodeLanguage,
 ): Promise<string> {
   /*
-   * C doesn't have a Prettier parser.
-   * Use our own safe formatter.
+   * C uses the clang-format WASM engine (with a regex
+   * fallback if the WASM module can't load).
    */
   if (language === "c") {
     return formatCCode(text);
@@ -747,7 +764,7 @@ async function repairAndFormat(
    *
    * IMPORTANT:
    *
-   * Prettier can reject malformed OCR.
+   * Formatting can reject malformed OCR.
    * We DO NOT let that break extraction.
    *
    * If formatting fails, we return the
@@ -777,7 +794,7 @@ async function repairAndFormat(
     if (language === "c") {
       try {
         return {
-          text: formatCCode(repaired),
+          text: await formatCCode(repaired),
           formatted: true,
         };
       } catch {
@@ -816,6 +833,20 @@ export default function Extractor() {
   const [status, setStatus] = useState("");
 
   const [drag, setDrag] = useState(false);
+
+  /* =======================================================
+     WARM UP CLANG-FORMAT
+
+     Kick off the WASM download/init as soon as the
+     component mounts so the first C extraction isn't
+     slowed down waiting on it.
+  ======================================================= */
+
+  useEffect(() => {
+    ensureClangFormat().catch(() => {
+      // Ignored here; formatCCode() falls back gracefully.
+    });
+  }, []);
 
   /* =======================================================
      CLEANUP
