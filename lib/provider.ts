@@ -1,5 +1,3 @@
-import { Redis } from "@upstash/redis";
-
 export type Provider = "local" | "gemini" | "openai";
 
 const DEFAULT_PROVIDER: Provider =
@@ -9,55 +7,90 @@ const DEFAULT_PROVIDER: Provider =
       ? "openai"
       : "local";
 
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
 const PROVIDER_KEY = "snapextract:provider";
 
-function getRedis() {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+let memoryProvider: Provider = DEFAULT_PROVIDER;
 
-  if (!url || !token) {
+function isValidProvider(value: unknown): value is Provider {
+  return value === "local" || value === "gemini" || value === "openai";
+}
+
+async function upstashCommand(command: unknown[]) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
     return null;
   }
 
-  return new Redis({
-    url,
-    token,
+  const response = await fetch(UPSTASH_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${UPSTASH_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+    cache: "no-store",
   });
+
+  if (!response.ok) {
+    throw new Error(`Upstash request failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return data.result;
 }
 
 export async function getProvider(): Promise<Provider> {
-  const redis = getRedis();
+  /*
+   * Production:
+   *
+   * If Upstash is configured, always read the provider
+   * from persistent storage.
+   */
 
-  // -------------------------------------------------------
-  // PRODUCTION / UPSTASH
-  // -------------------------------------------------------
+  if (UPSTASH_URL && UPSTASH_TOKEN) {
+    try {
+      const result = await upstashCommand(["GET", PROVIDER_KEY]);
 
-  if (redis) {
-    const saved = await redis.get<string>(PROVIDER_KEY);
-
-    if (saved === "local" || saved === "gemini" || saved === "openai") {
-      return saved;
+      if (isValidProvider(result)) {
+        return result;
+      }
+    } catch (error) {
+      console.error("Failed to read provider from Upstash:", error);
     }
-
-    return DEFAULT_PROVIDER;
   }
 
-  // -------------------------------------------------------
-  // LOCAL DEVELOPMENT FALLBACK
-  // -------------------------------------------------------
+  /*
+   * Fallback for local development / servers without Upstash.
+   */
 
-  return DEFAULT_PROVIDER;
+  return memoryProvider;
 }
 
 export async function setProvider(provider: Provider): Promise<void> {
-  const redis = getRedis();
-
-  if (redis) {
-    await redis.set(PROVIDER_KEY, provider);
-    return;
+  if (!isValidProvider(provider)) {
+    throw new Error("Invalid provider.");
   }
 
-  console.warn(
-    "UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not configured. Provider was not persisted.",
-  );
+  /*
+   * Update memory immediately.
+   */
+
+  memoryProvider = provider;
+
+  /*
+   * Persist globally when Upstash is configured.
+   */
+
+  if (UPSTASH_URL && UPSTASH_TOKEN) {
+    try {
+      await upstashCommand(["SET", PROVIDER_KEY, provider]);
+    } catch (error) {
+      console.error("Failed to save provider to Upstash:", error);
+
+      throw new Error("Could not persist provider setting.");
+    }
+  }
 }
