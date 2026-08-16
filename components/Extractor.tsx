@@ -1,6 +1,13 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  DragEvent,
+  SyntheticEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import {
   Check,
@@ -22,6 +29,14 @@ import typescriptPlugin from "prettier/plugins/typescript";
 import htmlPlugin from "prettier/plugins/html";
 import cssPlugin from "prettier/plugins/postcss";
 
+import ReactCrop, {
+  type Crop,
+  type PixelCrop,
+  centerCrop,
+  makeAspectCrop,
+} from "react-image-crop";
+import "react-image-crop/dist/ReactCrop.css";
+
 import initClangFormat, {
   format as clangFormat,
 } from "@wasm-fmt/clang-format/web";
@@ -31,6 +46,8 @@ type Mode = "auto" | "text" | "code" | "table";
 type CodeLanguage = "javascript" | "typescript" | "json" | "html" | "css" | "c";
 
 type ProcessingMode = "original" | "contrast" | "threshold" | "sharp";
+
+type Stage = "upload" | "crop" | "result";
 
 /* =========================================================
    LANGUAGE DETECTION
@@ -810,11 +827,82 @@ async function repairAndFormat(
 }
 
 /* =========================================================
+   CROP TO BLOB
+
+   react-image-crop reports the crop rectangle in the
+   *displayed* image's coordinate space, so we scale it up
+   to the image's natural resolution before drawing it onto
+   a canvas and reading the result back out as a file.
+========================================================= */
+
+function getCroppedImageBlob(
+  image: HTMLImageElement,
+  crop: PixelCrop,
+): Promise<Blob> {
+  const scaleX = image.naturalWidth / image.width;
+  const scaleY = image.naturalHeight / image.height;
+
+  const canvas = document.createElement("canvas");
+
+  canvas.width = Math.max(1, Math.round(crop.width * scaleX));
+  canvas.height = Math.max(1, Math.round(crop.height * scaleY));
+
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return Promise.reject(new Error("Could not initialize image cropping."));
+  }
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  ctx.drawImage(
+    image,
+    crop.x * scaleX,
+    crop.y * scaleY,
+    crop.width * scaleX,
+    crop.height * scaleY,
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  );
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          reject(new Error("Could not crop this image."));
+        }
+      },
+      "image/png",
+      1,
+    );
+  });
+}
+
+/* =========================================================
    MAIN COMPONENT
 ========================================================= */
 
 export default function Extractor() {
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const cropImageRef = useRef<HTMLImageElement>(null);
+
+  const [stage, setStage] = useState<Stage>("upload");
+
+  const [rawFile, setRawFile] = useState<File | null>(null);
+
+  const [rawPreview, setRawPreview] = useState("");
+
+  const [crop, setCrop] = useState<Crop>();
+
+  const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
+
+  const [croppingBusy, setCroppingBusy] = useState(false);
 
   const [file, setFile] = useState<File | null>(null);
 
@@ -860,6 +948,14 @@ export default function Extractor() {
     };
   }, [preview]);
 
+  useEffect(() => {
+    return () => {
+      if (rawPreview) {
+        URL.revokeObjectURL(rawPreview);
+      }
+    };
+  }, [rawPreview]);
+
   /* =======================================================
      SELECT FILE
   ======================================================= */
@@ -877,19 +973,124 @@ export default function Extractor() {
       return;
     }
 
+    if (rawPreview) {
+      URL.revokeObjectURL(rawPreview);
+    }
+
     if (preview) {
       URL.revokeObjectURL(preview);
     }
 
-    setFile(next);
+    setRawFile(next);
 
-    setPreview(URL.createObjectURL(next));
+    setRawPreview(URL.createObjectURL(next));
+
+    setCrop(undefined);
+
+    setCompletedCrop(undefined);
+
+    setFile(null);
+
+    setPreview("");
 
     setResult("");
 
     setStatus("");
 
     setCopying(false);
+
+    setStage("crop");
+  }
+
+  /* =======================================================
+     CROP SCREEN HELPERS
+  ======================================================= */
+
+  function onCropImageLoad(e: SyntheticEvent<HTMLImageElement>) {
+    const { width, height } = e.currentTarget;
+
+    // Start with a centered crop box covering most of the
+    // image, rather than forcing the user to draw one from
+    // scratch every time.
+    const initialCrop = centerCrop(
+      makeAspectCrop(
+        {
+          unit: "%",
+          width: 92,
+        },
+        width / height,
+        width,
+        height,
+      ),
+      width,
+      height,
+    );
+
+    setCrop(initialCrop);
+  }
+
+  async function confirmCrop() {
+    if (!rawFile) return;
+
+    const image = cropImageRef.current;
+
+    // If there's no meaningful crop selection, just use the
+    // whole image untouched.
+    if (
+      !image ||
+      !completedCrop ||
+      !completedCrop.width ||
+      !completedCrop.height
+    ) {
+      useFullImage();
+      return;
+    }
+
+    setCroppingBusy(true);
+
+    try {
+      const blob = await getCroppedImageBlob(image, completedCrop);
+
+      const cropped = new File([blob], rawFile.name, {
+        type: "image/png",
+      });
+
+      finalizeFile(cropped);
+    } catch {
+      setStatus("Couldn't crop that image. Using the full screenshot instead.");
+
+      useFullImage();
+    } finally {
+      setCroppingBusy(false);
+    }
+  }
+
+  function useFullImage() {
+    if (!rawFile) return;
+
+    finalizeFile(rawFile);
+  }
+
+  function finalizeFile(chosen: File) {
+    if (preview) {
+      URL.revokeObjectURL(preview);
+    }
+
+    setFile(chosen);
+
+    setPreview(URL.createObjectURL(chosen));
+
+    setResult("");
+
+    setStatus("");
+
+    setCopying(false);
+
+    setStage("result");
+  }
+
+  function backToCrop() {
+    setStage("crop");
   }
 
   /* =======================================================
@@ -1235,11 +1436,20 @@ export default function Extractor() {
       URL.revokeObjectURL(preview);
     }
 
+    if (rawPreview) {
+      URL.revokeObjectURL(rawPreview);
+    }
+
+    setRawFile(null);
+    setRawPreview("");
+    setCrop(undefined);
+    setCompletedCrop(undefined);
     setFile(null);
     setPreview("");
     setResult("");
     setStatus("");
     setCopying(false);
+    setStage("upload");
 
     if (inputRef.current) {
       inputRef.current.value = "";
@@ -1250,7 +1460,7 @@ export default function Extractor() {
      UPLOAD SCREEN
   ======================================================= */
 
-  if (!file) {
+  if (stage === "upload") {
     return (
       <div
         className={`dropzone ${drag ? "drag" : ""}`}
@@ -1300,6 +1510,71 @@ export default function Extractor() {
   }
 
   /* =======================================================
+     CROP SCREEN
+  ======================================================= */
+
+  if (stage === "crop") {
+    return (
+      <div className="preview">
+        <div className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="panel-head">
+            <span>Crop your screenshot</span>
+
+            <button className="secondary" onClick={clear}>
+              <X size={14} />
+              Remove
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "center",
+              padding: 16,
+              background: "var(--muted-bg, #f4f4f5)",
+            }}
+          >
+            <ReactCrop
+              crop={crop}
+              onChange={(_, percentCrop) => setCrop(percentCrop)}
+              onComplete={(pixelCrop) => setCompletedCrop(pixelCrop)}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                ref={cropImageRef}
+                src={rawPreview}
+                alt="Screenshot to crop"
+                onLoad={onCropImageLoad}
+                style={{ maxHeight: "60vh", display: "block" }}
+              />
+            </ReactCrop>
+          </div>
+
+          <div
+            className="actions"
+            style={{ justifyContent: "center", padding: "0 0 16px" }}
+          >
+            <button
+              className="primary"
+              onClick={confirmCrop}
+              disabled={croppingBusy}
+            >
+              <Sparkles size={16} />
+              {croppingBusy ? "Cropping…" : "Crop & continue"}
+            </button>
+
+            <button className="secondary" onClick={useFullImage}>
+              Use full image
+            </button>
+          </div>
+
+          {status && <div className="status">{status}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  /* =======================================================
      RESULT SCREEN
   ======================================================= */
 
@@ -1324,10 +1599,16 @@ export default function Extractor() {
           <div className="panel-head">
             <span>Screenshot</span>
 
-            <button className="secondary" onClick={clear}>
-              <X size={14} />
-              Remove
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="secondary" onClick={backToCrop}>
+                Re-crop
+              </button>
+
+              <button className="secondary" onClick={clear}>
+                <X size={14} />
+                Remove
+              </button>
+            </div>
           </div>
 
           <img

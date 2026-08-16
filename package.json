@@ -19,6 +19,7 @@
     "prettier-plugin-sql": "^0.20.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
+    "react-image-crop": "^11.1.2",
     "tesseract.js": "^6.0.1",
     "zod": "^4.0.0"
   },
