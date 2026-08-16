@@ -903,6 +903,202 @@ function repairByLanguage(text: string, language: CodeLanguage): string {
 }
 
 // ---------------------------------------------------------
+// C CODE FORMATTER
+// ---------------------------------------------------------
+
+function formatCCode(text: string): string {
+  let code = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+
+  const lines: string[] = [];
+  let current = "";
+  let indent = 0;
+
+  const INDENT = "    ";
+
+  function pushLine(line: string) {
+    const cleaned = line.trim();
+
+    if (!cleaned) return;
+
+    lines.push(`${INDENT.repeat(Math.max(indent, 0))}${cleaned}`);
+  }
+
+  function flushCurrent() {
+    const cleaned = current.trim();
+
+    if (cleaned) {
+      pushLine(cleaned);
+    }
+
+    current = "";
+  }
+
+  let inString: string | null = null;
+  let escaped = false;
+
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+
+    // -----------------------------------------------------
+    // STRING HANDLING
+    // -----------------------------------------------------
+
+    if (inString) {
+      current += ch;
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (ch === inString) {
+        inString = null;
+      }
+
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      inString = ch;
+      current += ch;
+      continue;
+    }
+
+    // -----------------------------------------------------
+    // COMMENTS
+    // -----------------------------------------------------
+
+    if (ch === "/" && code[i + 1] === "/") {
+      current += "//";
+
+      i += 2;
+
+      while (i < code.length && code[i] !== "\n") {
+        current += code[i];
+        i++;
+      }
+
+      flushCurrent();
+
+      continue;
+    }
+
+    // -----------------------------------------------------
+    // OPEN BRACE
+    // -----------------------------------------------------
+
+    if (ch === "{") {
+      current = current.trim();
+
+      if (current) {
+        pushLine(`${current} {`);
+      } else {
+        pushLine("{");
+      }
+
+      current = "";
+
+      indent++;
+
+      continue;
+    }
+
+    // -----------------------------------------------------
+    // CLOSE BRACE
+    // -----------------------------------------------------
+
+    if (ch === "}") {
+      flushCurrent();
+
+      indent = Math.max(indent - 1, 0);
+
+      /*
+       * Handle } else {
+       * Handle } while (...);
+       */
+
+      const rest = code.slice(i + 1);
+
+      if (/^\s*else\b/.test(rest)) {
+        pushLine("} else {");
+
+        indent++;
+
+        const match = rest.match(/^\s*else\s*\{/);
+
+        if (match) {
+          i += match[0].length - 1;
+        }
+
+        continue;
+      }
+
+      if (/^\s*while\s*\(/.test(rest)) {
+        pushLine("}");
+
+        continue;
+      }
+
+      pushLine("}");
+
+      continue;
+    }
+
+    // -----------------------------------------------------
+    // SEMICOLON
+    // -----------------------------------------------------
+
+    if (ch === ";") {
+      current += ";";
+
+      flushCurrent();
+
+      continue;
+    }
+
+    // -----------------------------------------------------
+    // NEWLINE
+    // -----------------------------------------------------
+
+    if (ch === "\n") {
+      flushCurrent();
+
+      continue;
+    }
+
+    current += ch;
+  }
+
+  flushCurrent();
+
+  // -------------------------------------------------------
+  // CLEAN UP SPACING
+  // -------------------------------------------------------
+
+  let result = lines.join("\n");
+
+  result = result
+    .replace(/\(\s+/g, "(")
+    .replace(/\s+\)/g, ")")
+    .replace(/\[\s+/g, "[")
+    .replace(/\s+\]/g, "]")
+    .replace(/\s+,/g, ",")
+    .replace(/,\s*/g, ", ")
+    .replace(/\s*=\s*/g, " = ")
+    .replace(/\s*>=\s*/g, " >= ")
+    .replace(/\s*<=\s*/g, " <= ")
+    .replace(/\s*==\s*/g, " == ")
+    .replace(/\s*\+\+\s*/g, "++");
+
+  return result.trim();
+}
+
+// ---------------------------------------------------------
 // PRETTIER
 // ---------------------------------------------------------
 
@@ -910,15 +1106,17 @@ async function formatCode(
   text: string,
   language: CodeLanguage,
 ): Promise<string> {
-  /*
-   * Prettier does not support C.
-   *
-   * Therefore don't try to format C.
-   */
+  // -------------------------------------------------------
+  // C
+  // -------------------------------------------------------
 
   if (language === "c") {
-    return text.trim();
+    return formatCCode(text);
   }
+
+  // -------------------------------------------------------
+  // OTHER LANGUAGES
+  // -------------------------------------------------------
 
   const parser =
     language === "typescript"
@@ -950,7 +1148,6 @@ async function formatCode(
 
   return formatted.trim();
 }
-
 // ---------------------------------------------------------
 // REPAIR + FORMAT PIPELINE
 // ---------------------------------------------------------
@@ -991,7 +1188,7 @@ async function repairAndFormat(
 
     return {
       text: formatted,
-      formatted: language !== "c",
+      formatted: true,
     };
   } catch {
     return {
